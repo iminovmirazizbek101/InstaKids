@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+media/
+staticfiles/
+credentials.json
+token.json
+*.json.tmp
