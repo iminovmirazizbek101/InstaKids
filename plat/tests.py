@@ -2,10 +2,19 @@ from django.conf import settings
 from django.test import TestCase
 from django.contrib.auth.models import User
 from rest_framework.test import APITestCase
+from unittest.mock import patch
 from .models import SocialState
 
 
 class RegistrationTests(APITestCase):
+	@patch('plat.views._issue_code', side_effect=RuntimeError('private credential detail'))
+	def test_password_reset_does_not_expose_email_service_errors(self, _issue_code):
+		User.objects.create_user(username='reset_user', email='reset@example.com', password='secret123')
+		response = self.client.post('/plat/send-code/', {'username': 'reset_user'}, format='json')
+
+		self.assertEqual(response.status_code, 502)
+		self.assertNotIn('private credential detail', str(response.data))
+
 	def test_vite_dev_server_is_trusted_for_csrf(self):
 		self.assertIn('http://localhost:5173', settings.CSRF_TRUSTED_ORIGINS)
 		self.assertIn('http://127.0.0.1:5173', settings.CSRF_TRUSTED_ORIGINS)
@@ -20,6 +29,7 @@ class RegistrationTests(APITestCase):
 		response = self.client.post('/plat/register/', {
 			'username': 'new_user',
 			'name': 'New User',
+			'email': 'new_user@example.com',
 			'password': 'secret123',
 		}, format='json')
 
@@ -67,11 +77,18 @@ class RegistrationTests(APITestCase):
 		self.assertEqual(response.status_code, 401)
 
 	def test_users_returns_registered_accounts(self):
-		User.objects.create_user(username='visible_user', first_name='Visible')
+		user = User.objects.create_user(username='visible_user', first_name='Visible')
+		self.client.force_login(user)
 		response = self.client.get('/plat/users/')
 
 		self.assertEqual(response.status_code, 200)
 		self.assertEqual(response.data[0]['username'], 'visible_user')
+
+	def test_users_does_not_expose_accounts_to_anonymous_visitors(self):
+		User.objects.create_user(username='private_user', first_name='Private', password='secret123')
+		response = self.client.get('/plat/users/')
+
+		self.assertEqual(response.status_code, 403)
 
 	def test_profile_avatar_is_shared_and_only_owner_can_update_it(self):
 		owner = User.objects.create_user(username='profile_owner', first_name='Owner', password='password123')
@@ -92,9 +109,26 @@ class RegistrationTests(APITestCase):
 		self.assertEqual(owner_profile['avatar'], 'data:image/jpeg;base64,abc')
 		self.assertIsNone(viewer_profile['avatar'])
 
+	def test_profile_update_endpoint_shares_avatar_with_other_accounts(self):
+		owner = User.objects.create_user(username='avatar_owner', password='password123')
+		viewer = User.objects.create_user(username='avatar_viewer', password='password123')
+		self.client.force_login(owner)
+		response = self.client.put('/plat/profile/', {
+			'name': 'Avatar Owner',
+			'bio': 'Hello',
+			'avatar': 'data:image/jpeg;base64,shared-avatar',
+		}, format='json')
+		self.assertEqual(response.status_code, 200)
+
+		self.client.force_login(viewer)
+		accounts = self.client.get('/plat/users/').data
+		owner_profile = next(account for account in accounts if account['username'] == 'avatar_owner')
+		self.assertEqual(owner_profile['avatar'], 'data:image/jpeg;base64,shared-avatar')
+
 	def test_admin_users_are_hidden_from_public_user_list(self):
 		User.objects.create_user(username='visible_user', first_name='Visible')
-		User.objects.create_superuser(username='admin', email='admin@example.com', password='admin123')
+		admin = User.objects.create_superuser(username='admin', email='admin@example.com', password='admin123')
+		self.client.force_login(admin)
 		response = self.client.get('/plat/users/')
 
 		self.assertEqual(response.status_code, 200)
@@ -105,16 +139,26 @@ class RegistrationTests(APITestCase):
 	def test_admin_can_delete_user_and_login_fails_afterward(self):
 		admin = User.objects.create_superuser(username='admin', email='admin@example.com', password='admin123')
 		User.objects.create_user(username='ghost_user', password='secret123')
+		User.objects.create_user(username='keeper', password='secret123')
 		state = SocialState.objects.create(payload={
 			'posts': [{'id': 'ghost-post', 'userId': 'ghost_user', 'likes': [], 'comments': []}],
-			'reels': [{'id': 'ghost-reel', 'userId': 'ghost_user', 'likes': ['ghost_user']}],
+			'reels': [
+				{'id': 'ghost-reel', 'userId': 'ghost_user', 'likes': ['ghost_user'], 'comments': []},
+				{'id': 'keeper-reel', 'userId': 'keeper', 'likes': ['ghost_user'], 'comments': [
+					{'id': 'ghost-comment', 'userId': 'ghost_user'},
+					{'id': 'keeper-comment', 'userId': 'keeper'},
+				]},
+			],
 			'stories': [{'id': 'ghost-story', 'userId': 'ghost_user'}],
 			'seenStories': [{'storyId': 'ghost-story', 'viewerId': 'other'}],
 			'follows': [{'a': 'other', 'b': 'ghost_user'}],
 			'messages': [{'id': 'ghost-message', 'from': 'ghost_user', 'to': 'other'}],
 			'deletedMessages': [],
 			'notifs': [{'id': 'ghost-notif', 'from': 'other', 'to': 'ghost_user'}],
-			'saved': {'ghost_user': ['ghost-post']},
+			'saved': {
+				'ghost_user': ['ghost-post', 'reel:ghost-reel'],
+				'keeper': ['ghost-post', 'reel:ghost-reel', 'reel:keeper-reel'],
+			},
 			'presence': {'ghost_user': 123},
 			'signals': [{'id': 'signal-1', 'from': 'ghost_user', 'to': 'other'}],
 			'callSessions': [{'id': 'call-1', 'from': 'other', 'to': 'ghost_user'}],
@@ -126,13 +170,16 @@ class RegistrationTests(APITestCase):
 		self.assertFalse(User.objects.filter(username='ghost_user').exists())
 		state.refresh_from_db()
 		self.assertFalse(state.payload['posts'])
-		self.assertFalse(state.payload['reels'])
+		self.assertEqual([reel['id'] for reel in state.payload['reels']], ['keeper-reel'])
+		self.assertEqual(state.payload['reels'][0]['likes'], [])
+		self.assertEqual(state.payload['reels'][0]['comments'], [{'id': 'keeper-comment', 'userId': 'keeper'}])
 		self.assertFalse(state.payload['stories'])
 		self.assertFalse(state.payload['seenStories'])
 		self.assertFalse(state.payload['follows'])
 		self.assertFalse(state.payload['messages'])
 		self.assertFalse(state.payload['notifs'])
 		self.assertNotIn('ghost_user', state.payload['saved'])
+		self.assertEqual(state.payload['saved']['keeper'], ['reel:keeper-reel'])
 		self.assertNotIn('ghost_user', state.payload['presence'])
 		self.assertFalse(state.payload['signals'])
 		self.assertFalse(state.payload['callSessions'])
@@ -170,19 +217,81 @@ class RegistrationTests(APITestCase):
 
 		self.assertEqual(response.status_code, 403)
 
+	def test_message_sync_is_authenticated_and_scoped_to_current_user(self):
+		owner = User.objects.create_user(username='message_owner', password='password123')
+		SocialState.objects.create(payload={'messages': [
+			{'id': 'visible', 'from': 'message_owner', 'to': 'friend'},
+			{'id': 'private', 'from': 'stranger', 'to': 'someone_else'},
+		]})
+		self.assertEqual(self.client.get('/plat/messages/').status_code, 403)
+
+		self.client.force_login(owner)
+		response = self.client.get('/plat/messages/')
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual([item['id'] for item in response.data['messages']], ['visible'])
+
+	def test_reel_message_is_saved_immediately_for_recipient(self):
+		sender = User.objects.create_user(username='reel_sender', password='password123')
+		User.objects.create_user(username='reel_receiver', password='password123')
+		self.client.force_login(sender)
+		response = self.client.post('/plat/messages/', {
+			'id': 'shared-reel-message',
+			'to': 'reel_receiver',
+			'text': '🎬 Reels: Yangi video',
+			'reelId': 'saved-reel-1',
+			'src': 'data:video/mp4;base64,AAAA',
+			'mediaType': 'video',
+		}, format='json')
+		self.assertEqual(response.status_code, 201)
+
+		self.client.force_login(User.objects.get(username='reel_receiver'))
+		messages = self.client.get('/plat/messages/').data['messages']
+		self.assertEqual(len(messages), 1)
+		self.assertEqual(messages[0]['reelId'], 'saved-reel-1')
+		self.assertEqual(messages[0]['mediaType'], 'video')
+		self.assertEqual(messages[0]['src'], 'data:video/mp4;base64,AAAA')
+
+	def test_message_reactions_sync_without_overwriting_other_users(self):
+		sender = User.objects.create_user(username='reaction_sender', password='password123')
+		reactor = User.objects.create_user(username='reaction_user', password='password123')
+		SocialState.objects.create(payload={'messages': [{
+			'id': 'shared-message', 'from': 'reaction_sender', 'to': 'reaction_user', 'text': 'Hello', 'likes': [],
+		}]})
+		self.client.force_login(reactor)
+		response = self.client.put('/plat/social/', {
+			'messages': [{
+				'id': 'shared-message', 'from': 'reaction_sender', 'to': 'reaction_user',
+				'text': 'Hello', 'likes': ['reaction_user'],
+			}],
+		}, format='json')
+		self.assertEqual(response.status_code, 200)
+
+		self.client.force_login(sender)
+		messages = self.client.get('/plat/messages/').data['messages']
+		self.assertEqual(messages[0]['likes'], ['reaction_user'])
+
 	def test_follow_changes_are_saved_immediately_and_can_be_undone(self):
 		owner = User.objects.create_user(username='follow_owner', password='password123')
-		User.objects.create_user(username='follow_target', password='password123')
+		target = User.objects.create_user(username='follow_target', password='password123')
+		self.assertEqual(self.client.get('/plat/notifications/').status_code, 403)
 		self.client.force_login(owner)
 
 		response = self.client.post('/plat/follow/', {
-			'username': 'follow_target', 'following': True,
+			'username': 'follow_target', 'following': True, 'notificationId': 'follow-event-1',
 		}, format='json')
 		self.assertEqual(response.status_code, 200)
 		self.assertEqual(self.client.get('/plat/social/').data['follows'], [
 			{'a': 'follow_owner', 'b': 'follow_target'},
 		])
+		self.assertEqual(self.client.get('/plat/notifications/').status_code, 200)
+		self.client.force_login(target)
+		notifications = self.client.get('/plat/notifications/').data['notifications']
+		self.assertEqual(len(notifications), 1)
+		self.assertEqual(notifications[0]['type'], 'follow')
+		self.assertEqual(notifications[0]['from'], 'follow_owner')
 
+		self.client.force_login(owner)
 		response = self.client.post('/plat/follow/', {
 			'username': 'follow_target', 'following': False,
 		}, format='json')
@@ -232,6 +341,49 @@ class RegistrationTests(APITestCase):
 		self.assertEqual(state.payload['posts'], [{'id': 'p1', 'userId': 'owner'}])
 		response = self.client.get('/plat/social/')
 		self.assertEqual([message['id'] for message in response.data['messages']], ['m1'])
+
+	def test_story_likes_persist_and_are_visible_to_story_owner(self):
+		owner = User.objects.create_user(username='story_owner', password='password123')
+		liker = User.objects.create_user(username='story_liker', password='password123')
+		SocialState.objects.create(payload={'stories': [
+			{'id': 'persistent-story', 'userId': 'story_owner', 'likes': []},
+		]})
+		self.client.force_login(liker)
+		response = self.client.put('/plat/social/', {
+			'stories': [{'id': 'persistent-story', 'userId': 'story_owner', 'likes': ['story_liker']}],
+		}, format='json')
+		self.assertEqual(response.status_code, 200)
+
+		self.client.force_login(owner)
+		stories = self.client.get('/plat/social/').data['stories']
+		self.assertEqual(stories[0]['likes'], ['story_liker'])
+
+	def test_comment_like_persists_and_only_author_can_delete(self):
+		author = User.objects.create_user(username='comment_author', password='password123')
+		liker = User.objects.create_user(username='comment_liker', password='password123')
+		SocialState.objects.create(payload={'posts': [{
+			'id': 'comment-post', 'userId': 'comment_author', 'likes': [],
+			'comments': [{'id': 'comment-1', 'userId': 'comment_author', 'text': 'Hello', 'likes': []}],
+		}]})
+		self.client.force_login(liker)
+		response = self.client.post('/plat/comments/action/', {
+			'mediaType': 'post', 'mediaId': 'comment-post', 'commentId': 'comment-1', 'action': 'like',
+		}, format='json')
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response.data['likes'], ['comment_liker'])
+
+		response = self.client.post('/plat/comments/action/', {
+			'mediaType': 'post', 'mediaId': 'comment-post', 'commentId': 'comment-1', 'action': 'delete',
+		}, format='json')
+		self.assertEqual(response.status_code, 403)
+
+		self.client.force_login(author)
+		response = self.client.post('/plat/comments/action/', {
+			'mediaType': 'post', 'mediaId': 'comment-post', 'commentId': 'comment-1', 'action': 'delete',
+		}, format='json')
+		self.assertEqual(response.status_code, 200)
+		state = SocialState.objects.get(pk=1)
+		self.assertFalse(state.payload['posts'][0]['comments'])
 
 	def test_social_state_keeps_other_posts_and_merges_only_current_users_interactions(self):
 		owner = User.objects.create_user(username='owner', password='password123')

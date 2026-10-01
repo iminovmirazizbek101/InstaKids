@@ -10,12 +10,15 @@ from rest_framework.decorators import api_view, authentication_classes, permissi
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
+import logging
 import random
 from datetime import timedelta
 from .gmail_service import send_gmail_message
 from django.utils import timezone
 from .models import SocialState, EmailCode
 import uuid
+
+logger = logging.getLogger(__name__)
 
 
 def _merge_owned_media(existing, incoming, username, allow_interactions=False):
@@ -117,9 +120,9 @@ def send_code(request):
         sent = _issue_code(email, purpose)
     except ValueError as exc:
         return Response({'error': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
-    except Exception as exc:
-        message = str(exc).strip() or 'Gmail API bilan ulanishda xatolik'
-        return Response({'error': f'Gmailga kod yuborilmadi: {message}'}, status=status.HTTP_502_BAD_GATEWAY)
+    except Exception:
+        logger.exception('Gmail verification code delivery failed')
+        return Response({'error': 'Gmailga kod yuborilmadi. Keyinroq qayta urinib ko‘ring.'}, status=status.HTTP_502_BAD_GATEWAY)
     if not sent:
         return Response({'error': '30 soniya kuting va qayta urinib ko‘ring'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
     masked = email[0] + '***' + email[email.index('@'):]
@@ -162,18 +165,18 @@ def register(request):
         return Response({'error': 'Ismingizni kiriting'}, status=status.HTTP_400_BAD_REQUEST)
     if len(password) < 4:
         return Response({'error': 'Parol kamida 4 ta belgi'}, status=status.HTTP_400_BAD_REQUEST)
-    if User.objects.filter(username=username).exists():
-        return Response({'error': 'Bu username band'}, status=status.HTTP_409_CONFLICT)
-    if '@' not in email or '.' not in email.split('@')[-1]:
-        return Response({'error': 'Email noto‘g‘ri kiritilgan'}, status=status.HTTP_400_BAD_REQUEST)
-    if User.objects.filter(email=email).exists():
-        return Response({'error': 'Bu email band'}, status=status.HTTP_409_CONFLICT)
-    existing_user = None
+
+    existing_user = User.objects.filter(username=username).first()
     if existing_user:
         if existing_user.check_password(password):
             auth_login(request._request, existing_user)
             return Response({'id': existing_user.id, 'username': existing_user.username, 'name': existing_user.first_name, 'csrfToken': get_token(request._request)})
         return Response({'error': 'Bu username band'}, status=status.HTTP_409_CONFLICT)
+
+    if '@' not in email or '.' not in email.split('@')[-1]:
+        return Response({'error': 'Email noto‘g‘ri kiritilgan'}, status=status.HTTP_400_BAD_REQUEST)
+    if User.objects.filter(email=email).exists():
+        return Response({'error': 'Bu email band'}, status=status.HTTP_409_CONFLICT)
 
     user = User.objects.create_user(username=username, first_name=name[:150], password=password, email=email)
     auth_login(request._request, user)
@@ -192,6 +195,8 @@ def login(request):
 
 
 @api_view(['GET', 'DELETE'])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
 def users(request):
     if request.method == 'DELETE':
         if not request.user.is_authenticated or not (request.user.is_staff or request.user.is_superuser):
@@ -216,6 +221,14 @@ def users(request):
                     item.get('id') for item in payload.get('stories', [])
                     if item.get('userId') == username
                 }
+                deleted_post_ids = {
+                    item.get('id') for item in payload.get('posts', [])
+                    if item.get('userId') == username
+                }
+                deleted_reel_ids = {
+                    item.get('id') for item in payload.get('reels', [])
+                    if item.get('userId') == username
+                }
                 payload['posts'] = [
                     item for item in payload.get('posts', [])
                     if item.get('userId') != username
@@ -232,6 +245,10 @@ def users(request):
                 ]
                 for reel in payload['reels']:
                     reel['likes'] = [user for user in reel.get('likes', []) if user != username]
+                    reel['comments'] = [
+                        comment for comment in reel.get('comments', [])
+                        if comment.get('userId') != username
+                    ]
                 payload['stories'] = [
                     item for item in payload.get('stories', [])
                     if item.get('userId') != username
@@ -253,7 +270,11 @@ def users(request):
                     item for item in payload.get('notifs', [])
                     if item.get('from') != username and item.get('to') != username
                 ]
-                payload.get('saved', {}).pop(username, None)
+                saved = payload.setdefault('saved', {})
+                deleted_saved_ids = deleted_post_ids | {f'reel:{reel_id}' for reel_id in deleted_reel_ids}
+                for saved_ids in saved.values():
+                    saved_ids[:] = [item_id for item_id in saved_ids if item_id not in deleted_saved_ids]
+                saved.pop(username, None)
                 payload.get('profiles', {}).pop(username, None)
                 payload.get('presence', {}).pop(username, None)
                 payload['signals'] = [
@@ -307,6 +328,131 @@ def change_password(request):
 def logout(request):
     auth_logout(request._request)
     return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(['GET', 'POST'])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def social_messages(request):
+    username = request.user.username
+    if request.method == 'POST':
+        recipient = str(request.data.get('to', '')).strip().lower()
+        message_id = str(request.data.get('id', '')).strip()
+        if not recipient or not message_id or not User.objects.filter(username=recipient, is_active=True).exists():
+            return Response({'error': 'Xabar qabul qiluvchisi yoki ID noto‘g‘ri'}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            state, _ = SocialState.objects.select_for_update().get_or_create(pk=1)
+            payload = state.payload or {}
+            messages = payload.setdefault('messages', [])
+            if not any(item.get('id') == message_id for item in messages):
+                message = {
+                    'id': message_id,
+                    'from': username,
+                    'to': recipient,
+                    't': int(request.data.get('t') or timezone.now().timestamp() * 1000),
+                    'read': False,
+                    'likes': [],
+                    'hiddenFor': [],
+                }
+                for key in ('text', 'src', 'mediaType', 'storyId', 'storyOwner', 'reelId', 'replyTo', 'sticker'):
+                    if key in request.data:
+                        message[key] = request.data[key]
+                messages.append(message)
+                state.payload = payload
+                state.save(update_fields=['payload', 'updated_at'])
+        return Response({'saved': True, 'id': message_id}, status=status.HTTP_201_CREATED)
+
+    state = SocialState.objects.filter(pk=1).first()
+    payload = (state.payload or {}) if state else {}
+    messages = [
+        item for item in payload.get('messages', [])
+        if item.get('from') == username or item.get('to') == username
+    ]
+    deleted_messages = [
+        item for item in payload.get('deletedMessages', [])
+        if item.get('from') == username or item.get('to') == username
+    ]
+    deleted_ids = {item.get('id') for item in deleted_messages}
+    return Response({
+        'messages': [item for item in messages if item.get('id') not in deleted_ids],
+        'deletedMessages': deleted_messages,
+    })
+
+
+@api_view(['POST'])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def comment_action(request):
+    media_type = request.data.get('mediaType')
+    media_id = request.data.get('mediaId')
+    comment_id = request.data.get('commentId')
+    action = request.data.get('action')
+    if media_type not in ('post', 'reel') or action not in ('like', 'delete'):
+        return Response({'error': 'Izoh amali noto‘g‘ri'}, status=status.HTTP_400_BAD_REQUEST)
+
+    media_key = 'posts' if media_type == 'post' else 'reels'
+    username = request.user.username
+    with transaction.atomic():
+        state, _ = SocialState.objects.select_for_update().get_or_create(pk=1)
+        payload = state.payload or {}
+        media = next((item for item in payload.get(media_key, []) if item.get('id') == media_id), None)
+        comment = next((item for item in (media or {}).get('comments', []) if item.get('id') == comment_id), None)
+        if not comment:
+            return Response({'error': 'Izoh topilmadi'}, status=status.HTTP_404_NOT_FOUND)
+
+        if action == 'delete':
+            if comment.get('userId') != username:
+                return Response({'error': 'Faqat izoh muallifi uni o‘chira oladi'}, status=status.HTTP_403_FORBIDDEN)
+            media['comments'] = [item for item in media.get('comments', []) if item.get('id') != comment_id]
+        else:
+            likes = set(comment.get('likes', []))
+            if username in likes:
+                likes.remove(username)
+            else:
+                likes.add(username)
+            comment['likes'] = list(likes)
+
+        state.payload = payload
+        state.save(update_fields=['payload', 'updated_at'])
+        return Response({'likes': comment.get('likes', []) if action == 'like' else []})
+
+
+@api_view(['GET'])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def social_notifications(request):
+    state = SocialState.objects.filter(pk=1).first()
+    payload = (state.payload or {}) if state else {}
+    username = request.user.username
+    return Response({
+        'notifications': [
+            item for item in payload.get('notifs', [])
+            if item.get('to') == username
+        ],
+    })
+
+
+@api_view(['PUT'])
+@authentication_classes([SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def update_profile(request):
+    name = str(request.data.get('name', request.user.first_name)).strip()[:150]
+    bio = str(request.data.get('bio', ''))[:5000]
+    avatar = request.data.get('avatar')
+    if avatar is not None and (not isinstance(avatar, str) or len(avatar) > 2_000_000):
+        return Response({'error': 'Profil rasmi hajmi juda katta'}, status=status.HTTP_400_BAD_REQUEST)
+
+    with transaction.atomic():
+        state, _ = SocialState.objects.select_for_update().get_or_create(pk=1)
+        payload = state.payload or {}
+        profiles = payload.setdefault('profiles', {})
+        profiles[request.user.username] = {'name': name, 'bio': bio, 'avatar': avatar}
+        state.payload = payload
+        state.save(update_fields=['payload', 'updated_at'])
+        if request.user.first_name != name:
+            request.user.first_name = name
+            request.user.save(update_fields=['first_name'])
+    return Response({'name': name, 'bio': bio, 'avatar': avatar})
 
 
 @api_view(['GET', 'PUT'])
@@ -387,8 +533,14 @@ def social_state(request):
         message_id = item.get('id')
         old_item = message_map.get(message_id)
         if old_item:
+            if username in (old_item.get('from'), old_item.get('to')):
+                likes = set(old_item.get('likes', []))
+                likes.discard(username)
+                if username in item.get('likes', []):
+                    likes.add(username)
+                old_item['likes'] = list(likes)
             if old_item.get('from') == username:
-                for key in ('text', 'src', 'mediaType', 'edited', 'storyId', 'storyOwner'):
+                for key in ('text', 'src', 'mediaType', 'edited', 'storyId', 'storyOwner', 'replyTo', 'sticker'):
                     if key in item:
                         old_item[key] = item[key]
             if old_item.get('to') == username:

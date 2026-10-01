@@ -1,9 +1,0 @@
-Gmail API tayyor.
-
-1) credentials.json ni Google Cloud'dan yuklab StartApp papkasiga qo'ying.
-2) .env ichida GMAIL_SENDER_EMAIL ni yozing.
-3) pip install -r requirements.txt
-4) python manage.py gmail_auth
-5) python manage.py runserver
-
-App Password kerak emas.
